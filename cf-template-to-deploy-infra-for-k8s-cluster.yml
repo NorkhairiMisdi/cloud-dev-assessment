@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A complete CloudFormation template to create an EKS cluster and
+  deploy a Kubernetes manifest to it. This uses a Lambda-backed
+  Custom Resource to execute the kubectl apply command.
+
+Resources:
+  # IAM Role for the EKS Cluster
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+
+  # IAM Role for the EKS Worker Nodes
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  # The EKS Cluster itself
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: MyEksCluster
+      RoleArn: !GetAtt EksClusterRole.Arn
+      Version: "1.28" # Using a recent version
+      ResourcesVpcConfig:
+        SubnetIds:
+          # IMPORTANT: Replace these with your actual subnet IDs
+          - subnet-0a1b2c3d4e5f6g7h8
+          - subnet-0h8g7f6e5d4c3b2a1
+        SecurityGroupIds:
+          # IMPORTANT: Replace with your VPC's security group
+          - sg-0123456789abcdef0
+
+  # The Managed Node Group for the worker nodes
+  EksNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodeRole: !GetAtt EksNodeRole.Arn
+      Subnets:
+        # IMPORTANT: Use the same subnet IDs as the cluster
+        - subnet-0a1b2c3d4e5f6g7h8
+        - subnet-0h8g7f6e5d4c3b2a1
+      ScalingConfig:
+        MinSize: 2
+        MaxSize: 3
+        DesiredSize: 2
+      InstanceTypes:
+        - t3.medium
+
+  # IAM Role for the Lambda function
+  KubectlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KubectlLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                  - eks:UpdateClusterConfig
+                  - eks:AccessKubernetesApi
+                  - iam:GetRole
+                  - sts:GetCallerIdentity
+                  - sts:AssumeRole
+                  - ec2:DescribeSubnets
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # The Lambda function that deploys the manifest
+  KubectlLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt KubectlLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref EksCluster
+          KUBE_MANIFEST: |
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: app-namespace
+            ---
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: env-secret
+              namespace: app-namespace
+            type: Opaque
+            stringData:
+              APP_API_KEY: "your-api-key-here"
+            ---
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: tls-secret
+              namespace: app-namespace
+            type: kubernetes.io/tls
+            data:
+              tls.crt: |
+                LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
+              tls.key: |
+                LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCg==
+            ---
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: app-config
+              namespace: app-namespace
+            data:
+              config.json: |
+                {
+                  "logLevel": "info",
+                  "featureFlags": {
+                    "beta": false
+                  }
+                }
+            ---
+            apiVersion: v1
+            kind: PersistentVolume
+            metadata:
+              name: app-pv
+              namespace: app-namespace
+            spec:
+              capacity:
+                storage: 5Gi
+              accessModes:
+                - ReadWriteMany
+              persistentVolumeReclaimPolicy: Retain
+              csi:
+                driver: efs.csi.aws.com
+                volumeHandle: fs-12345678
+            ---
+            apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata:
+              name: app-pvc
+              namespace: app-namespace
+            spec:
+              accessModes:
+                - ReadWriteMany
+              resources:
+                requests:
+                  storage: 5Gi
+            ---
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: app-deployment
+              namespace: app-namespace
+            spec:
+              replicas: 2
+              selector:
+                matchLabels:
+                  app: my-app
+              template:
+                metadata:
+                  labels:
+                    app: my-app
+                spec:
+                  affinity:
+                    podAntiAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        - labelSelector:
+                            matchExpressions:
+                              - key: app
+                                operator: In
+                                values:
+                                  - my-app
+                          topologyKey: "topology.kubernetes.io/zone"
+                  volumes:
+                    - name: config-volume
+                      configMap:
+                        name: app-config
+                    - name: pv-storage
+                      persistentVolumeClaim:
+                        claimName: app-pvc
+                  containers:
+                  - name: main-app-container
+                    image: busybox
+                    ports:
+                      - containerPort: 8080
+                    envFrom:
+                      - secretRef:
+                          name: env-secret
+                    volumeMounts:
+                      - name: config-volume
+                        mountPath: "/etc/config"
+                      - name: pv-storage
+                        mountPath: "/data"
+                  - name: busybox-container
+                    image: busybox
+                    command: ["sh", "-c", "echo 'I am a busybox sidecar container' && sleep infinity"]
+                    volumeMounts:
+                      - name: pv-storage
+                        mountPath: "/data"
+            ---
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: app-service
+              namespace: app-namespace
+            spec:
+              selector:
+                app: my-app
+              ports:
+                - protocol: TCP
+                  port: 80
+                  targetPort: 8080
+            ---
+            apiVersion: networking.k8s.io/v1
+            kind: Ingress
+            metadata:
+              name: app-ingress
+              namespace: app-namespace
+              annotations:
+                kubernetes.io/ingress.class: nginx
+                cert-manager.io/cluster-issuer: letsencrypt-prod
+            spec:
+              tls:
+                - hosts:
+                    - example.com
+                  secretName: tls-secret
+              rules:
+                - host: example.com
+                  http:
+                    paths:
+                      - path: /
+                        pathType: Prefix
+                        backend:
+                          service:
+                            name: app-service
+                            port:
+                              number: 80
+            ---
+            apiVersion: autoscaling/v2
+            kind: HorizontalPodAutoscaler
+            metadata:
+              name: app-hpa
+              namespace: app-namespace
+            spec:
+              scaleTargetRef:
+                apiVersion: apps/v1
+                kind: Deployment
+                name: app-deployment
+              minReplicas: 2
+              maxReplicas: 5
+              metrics:
+                - type: Resource
+                  resource:
+                    name: cpu
+                    target:
+                      type: Utilization
+                      averageUtilization: 50
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import subprocess
+          import sys
+          import urllib.request
+          import cfnresponse
+
+          def handler(event, context):
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # For simplicity, we skip deletion of K8s resources.
+                      # In a production setup, you would add logic to delete the manifest here.
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  cluster_name = os.environ['CLUSTER_NAME']
+                  kube_manifest = os.environ['KUBE_MANIFEST']
+                  
+                  # Install kubectl and aws-iam-authenticator
+                  subprocess.run(['curl', '-LO', 'https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl'], check=True)
+                  subprocess.run(['chmod', '+x', 'kubectl'], check=True)
+                  os.environ['PATH'] = os.environ['PATH'] + ':' + os.getcwd()
+
+                  subprocess.run(['curl', '-o', 'aws-iam-authenticator', 'https://s3.us-west-2.amazonaws.com/amazon-eks/1.28.0/2023-11-14/bin/linux/amd64/aws-iam-authenticator'], check=True)
+                  subprocess.run(['chmod', '+x', 'aws-iam-authenticator'], check=True)
+                  
+                  # Configure kubectl
+                  subprocess.run(['aws', 'eks', 'update-kubeconfig', '--name', cluster_name, '--region', os.environ['AWS_REGION']], check=True)
+                  
+                  # Write the manifest to a file
+                  with open('app-manifest.yaml', 'w') as f:
+                      f.write(kube_manifest)
+
+                  # Apply the manifest to the cluster
+                  subprocess.run(['kubectl', 'apply', '-f', 'app-manifest.yaml'], check=True)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logger.error(e, exc_info=True)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Reason': str(e)})
+
+  # The Custom Resource that triggers the Lambda function
+  K8sManifestDeployment:
+    Type: Custom::KubernetesManifest
+    Properties:
+      ServiceToken: !GetAtt KubectlLambdaFunction.Arn
+      ClusterName: !Ref EksCluster
+      Manifest: !Sub "${KubectlLambdaFunction.Environment.Variables.KUBE_MANIFEST}"
+
+Outputs:
+  ClusterName:
+    Description: The name of the EKS cluster.
+    Value: !Ref EksCluster
+
+  NodeGroupStackName:
+    Description: The name of the CloudFormation stack for the node group.
+    Value: !Ref EksNodeGroup

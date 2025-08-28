@@ -1,0 +1,184 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-namespace
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: env-secret
+  namespace: app-namespace
+type: Opaque
+stringData:
+  APP_API_KEY: "your-api-key-here"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-secret
+  namespace: app-namespace
+type: kubernetes.io/tls
+data:
+  # This data should be your base64 encoded TLS certificate and key.
+  # Use `openssl base64 -in tls.crt | tr -d '\n'` to encode.
+  tls.crt: |
+    # Paste your base64-encoded certificate here
+    LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
+  tls.key: |
+    # Paste your base64-encoded private key here
+    LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCg==
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: app-namespace
+data:
+  # This will be mounted as a file inside the pod
+  config.json: |
+    {
+      "logLevel": "info",
+      "featureFlags": {
+        "beta": false
+      }
+    }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app-pv
+  namespace: app-namespace
+spec:
+  # Updated to use a real-world CSI driver and ReadWriteMany access mode.
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteMany # Changed to ReadWriteMany, common for cloud storage like EFS.
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: efs.csi.aws.com # Placeholder for a real CSI driver.
+    volumeHandle: fs-12345678 # Replace with EFS ID
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-pvc
+  namespace: app-namespace
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deployment
+  namespace: app-namespace
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      # Updated anti-affinity to a "required" rule for stronger HA.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - my-app
+              topologyKey: "topology.kubernetes.io/zone"
+      volumes:
+        - name: config-volume
+          configMap:
+            name: app-config
+        - name: pv-storage
+          persistentVolumeClaim:
+            claimName: app-pvc
+      containers:
+      - name: main-app-container
+        image: busybox
+        ports:
+          - containerPort: 8080
+        envFrom:
+          - secretRef:
+              name: env-secret
+        volumeMounts:
+          - name: config-volume
+            mountPath: "/etc/config"
+          - name: pv-storage
+            mountPath: "/data"
+      - name: busybox-container
+        image: busybox
+        command: ["sh", "-c", "echo 'I am a busybox sidecar container' && sleep infinity"]
+        volumeMounts:
+          - name: pv-storage
+            mountPath: "/data"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-service
+  namespace: app-namespace
+spec:
+  selector:
+    app: my-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: app-namespace
+  # Added annotations for cert-manager, a common best practice.
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts:
+        - example.com
+      secretName: tls-secret
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-service
+                port:
+                  number: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: app-hpa
+  namespace: app-namespace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app-deployment
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50 # Target 50% CPU utilization.
